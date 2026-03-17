@@ -1,0 +1,649 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+	"github.com/go-chi/httprate"
+	"github.com/google/uuid"
+
+	"github.com/onnwee/pulse-score/internal/auth"
+	billingcatalog "github.com/onnwee/pulse-score/internal/billing"
+	"github.com/onnwee/pulse-score/internal/config"
+	"github.com/onnwee/pulse-score/internal/database"
+	"github.com/onnwee/pulse-score/internal/handler"
+	"github.com/onnwee/pulse-score/internal/middleware"
+	"github.com/onnwee/pulse-score/internal/repository"
+	"github.com/onnwee/pulse-score/internal/service"
+	billingsvc "github.com/onnwee/pulse-score/internal/service/billing"
+	"github.com/onnwee/pulse-score/internal/service/scoring"
+)
+
+const (
+	corsMaxAgeSeconds                = 300
+	connectionMonitorIntervalSeconds = 60
+)
+
+func main() {
+	initLogger()
+
+	cfg := loadAndValidateConfig()
+	pool := openDatabase(cfg)
+	if pool != nil {
+		defer pool.P.Close()
+	}
+
+	jwtMgr := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTTL, cfg.JWT.RefreshTTL)
+	r := newRouter(cfg, pool, jwtMgr)
+	srv := newHTTPServer(cfg, r)
+	runServerWithGracefulShutdown(srv, cfg.Server.Environment)
+}
+
+func initLogger() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+}
+
+func loadAndValidateConfig() *config.Config {
+	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		slog.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+	return cfg
+}
+
+func openDatabase(cfg *config.Config) *database.Pool {
+	if cfg.Database.URL == "" {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dbPool, err := database.NewPool(ctx, database.PoolConfig{
+		URL:               cfg.Database.URL,
+		MaxConns:          int32(cfg.Database.MaxOpenConns),
+		MinConns:          int32(cfg.Database.MaxIdleConns),
+		MaxConnLifetime:   time.Duration(cfg.Database.MaxConnLifetime) * time.Second,
+		HealthCheckPeriod: time.Duration(cfg.Database.HealthCheckSec) * time.Second,
+	})
+	if err != nil {
+		slog.Warn("database not reachable at startup", "error", err)
+		return nil
+	}
+
+	return &database.Pool{P: dbPool}
+}
+
+func newRouter(cfg *config.Config, pool *database.Pool, jwtMgr *auth.JWTManager) *chi.Mux {
+	r := chi.NewRouter()
+
+	r.Use(chimw.RequestID)
+	r.Use(chimw.RealIP)
+	r.Use(chimw.Logger)
+	r.Use(chimw.Recoverer)
+	r.Use(middleware.SecurityHeaders)
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   cfg.CORS.AllowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Request-ID", "X-Organization-ID"},
+		ExposedHeaders:   []string{"X-Request-ID"},
+		AllowCredentials: true,
+		MaxAge:           corsMaxAgeSeconds,
+	}))
+	r.Use(httprate.LimitByIP(cfg.Rate.RequestsPerMinute, time.Minute))
+
+	health := handler.NewHealthHandler(pool)
+	r.Get("/healthz", health.Liveness)
+	r.Get("/readyz", health.Readiness)
+
+	registerAPIRoutes(r, cfg, pool, jwtMgr)
+	return r
+}
+
+func registerAPIRoutes(r *chi.Mux, cfg *config.Config, pool *database.Pool, jwtMgr *auth.JWTManager) {
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Get("/ping", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"message":"pong"}`))
+		})
+
+		// Auth routes (public)
+		if pool != nil {
+			userRepo := repository.NewUserRepository(pool.P)
+			orgRepo := repository.NewOrganizationRepository(pool.P)
+			orgSubRepo := repository.NewOrgSubscriptionRepository(pool.P)
+			refreshTokenRepo := repository.NewRefreshTokenRepository(pool.P)
+			invitationRepo := repository.NewInvitationRepository(pool.P)
+			passwordResetRepo := repository.NewPasswordResetRepository(pool.P)
+			billingWebhookEventRepo := repository.NewBillingWebhookEventRepository(pool.P)
+
+			emailSvc := service.NewSendGridEmailService(service.SendGridConfig{
+				APIKey:      cfg.SendGrid.APIKey,
+				FromEmail:   cfg.SendGrid.FromEmail,
+				FrontendURL: cfg.SendGrid.FrontendURL,
+				DevMode:     !cfg.IsProd(),
+			})
+
+			authSvc := service.NewAuthService(pool.P, userRepo, orgRepo, refreshTokenRepo, passwordResetRepo, jwtMgr, cfg.JWT.RefreshTTL, emailSvc)
+			authHandler := handler.NewAuthHandler(authSvc)
+
+			invitationSvc := service.NewInvitationService(pool.P, invitationRepo, orgRepo, userRepo, emailSvc, jwtMgr)
+			invitationHandler := handler.NewInvitationHandler(invitationSvc)
+
+			// Stripe integration repositories
+			connRepo := repository.NewIntegrationConnectionRepository(pool.P)
+			customerRepo := repository.NewCustomerRepository(pool.P)
+			subRepo := repository.NewStripeSubscriptionRepository(pool.P)
+			paymentRepo := repository.NewStripePaymentRepository(pool.P)
+			eventRepo := repository.NewCustomerEventRepository(pool.P)
+
+			// HubSpot/Intercom repositories
+			hubspotContactRepo := repository.NewHubSpotContactRepository(pool.P)
+			hubspotDealRepo := repository.NewHubSpotDealRepository(pool.P)
+			hubspotCompanyRepo := repository.NewHubSpotCompanyRepository(pool.P)
+			intercomContactRepo := repository.NewIntercomContactRepository(pool.P)
+			intercomConversationRepo := repository.NewIntercomConversationRepository(pool.P)
+
+			// Onboarding repositories
+			onboardingStatusRepo := repository.NewOnboardingStatusRepository(pool.P)
+			onboardingEventRepo := repository.NewOnboardingEventRepository(pool.P)
+
+			// Stripe services
+			planCatalog := billingcatalog.NewCatalog(billingcatalog.PriceConfig{
+				GrowthMonthly: cfg.BillingStripe.PriceGrowthMonthly,
+				GrowthAnnual:  cfg.BillingStripe.PriceGrowthAnnual,
+				ScaleMonthly:  cfg.BillingStripe.PriceScaleMonthly,
+				ScaleAnnual:   cfg.BillingStripe.PriceScaleAnnual,
+			})
+
+			if cfg.IsProd() {
+				if err := billingcatalog.VerifyConfiguredPrices(context.Background(), cfg.BillingStripe.SecretKey, planCatalog); err != nil {
+					slog.Error("invalid Stripe billing price configuration", "error", err)
+					os.Exit(1)
+				}
+			}
+
+			stripeOAuthSvc := service.NewStripeOAuthService(service.StripeOAuthConfig{
+				ClientID:         cfg.Stripe.ClientID,
+				SecretKey:        cfg.Stripe.SecretKey,
+				OAuthRedirectURL: cfg.Stripe.OAuthRedirectURL,
+				EncryptionKey:    cfg.Stripe.EncryptionKey,
+			}, connRepo)
+
+			hubspotOAuthSvc := service.NewHubSpotOAuthService(service.HubSpotOAuthConfig{
+				ClientID:         cfg.HubSpot.ClientID,
+				ClientSecret:     cfg.HubSpot.ClientSecret,
+				OAuthRedirectURL: cfg.HubSpot.OAuthRedirectURL,
+				EncryptionKey:    cfg.HubSpot.EncryptionKey,
+			}, connRepo)
+
+			intercomOAuthSvc := service.NewIntercomOAuthService(service.IntercomOAuthConfig{
+				ClientID:         cfg.Intercom.ClientID,
+				ClientSecret:     cfg.Intercom.ClientSecret,
+				OAuthRedirectURL: cfg.Intercom.OAuthRedirectURL,
+				EncryptionKey:    cfg.Intercom.EncryptionKey,
+			}, connRepo)
+
+			hubspotClient := service.NewHubSpotClient()
+			intercomClient := service.NewIntercomClient()
+
+			stripeSyncSvc := service.NewStripeSyncService(
+				customerRepo, subRepo, paymentRepo, eventRepo,
+				stripeOAuthSvc, cfg.Stripe.PaymentSyncDays,
+			)
+
+			mergeSvc := service.NewCustomerMergeService(customerRepo, hubspotContactRepo)
+
+			hubspotSyncSvc := service.NewHubSpotSyncService(
+				hubspotOAuthSvc,
+				hubspotClient,
+				hubspotContactRepo,
+				hubspotDealRepo,
+				hubspotCompanyRepo,
+				customerRepo,
+				eventRepo,
+			)
+
+			intercomSyncSvc := service.NewIntercomSyncService(
+				intercomOAuthSvc,
+				intercomClient,
+				intercomContactRepo,
+				intercomConversationRepo,
+				customerRepo,
+				eventRepo,
+			)
+
+			mrrSvc := service.NewMRRService(customerRepo, subRepo, eventRepo)
+			paymentHealthSvc := service.NewPaymentHealthService(paymentRepo, eventRepo, customerRepo)
+			paymentRecencySvc := service.NewPaymentRecencyService(paymentRepo, subRepo)
+
+			syncOrchestrator := service.NewSyncOrchestratorService(connRepo, stripeSyncSvc, mrrSvc)
+			hubspotSyncOrchestrator := service.NewHubSpotSyncOrchestratorService(connRepo, hubspotSyncSvc, mergeSvc)
+			intercomSyncOrchestrator := service.NewIntercomSyncOrchestratorService(connRepo, intercomSyncSvc, mergeSvc)
+
+			stripeWebhookSvc := service.NewStripeWebhookService(
+				cfg.Stripe.WebhookSecret,
+				connRepo, customerRepo, subRepo, paymentRepo, eventRepo,
+				mrrSvc, paymentHealthSvc,
+			)
+
+			billingSubscriptionSvc := billingsvc.NewSubscriptionService(
+				orgSubRepo,
+				orgRepo,
+				customerRepo,
+				connRepo,
+				planCatalog,
+			)
+
+			billingLimitsSvc := billingsvc.NewLimitsService(
+				billingSubscriptionSvc,
+				customerRepo,
+				connRepo,
+				connRepo,
+				planCatalog,
+			)
+
+			billingCheckoutSvc := billingsvc.NewCheckoutService(
+				cfg.BillingStripe.SecretKey,
+				cfg.SendGrid.FrontendURL,
+				orgRepo,
+				planCatalog,
+			)
+
+			billingPortalSvc := billingsvc.NewPortalService(
+				cfg.BillingStripe.SecretKey,
+				cfg.BillingStripe.PortalReturnURL,
+				cfg.SendGrid.FrontendURL,
+				orgRepo,
+				orgSubRepo,
+			)
+
+			billingWebhookSvc := billingsvc.NewWebhookService(
+				cfg.BillingStripe.WebhookSecret,
+				pool.P,
+				orgRepo,
+				orgSubRepo,
+				billingWebhookEventRepo,
+				planCatalog,
+			)
+
+			hubspotWebhookSvc := service.NewHubSpotWebhookService(
+				cfg.HubSpot.WebhookSecret,
+				hubspotSyncSvc,
+				mergeSvc,
+				connRepo,
+				hubspotContactRepo,
+				hubspotDealRepo,
+				hubspotCompanyRepo,
+				eventRepo,
+			)
+
+			intercomWebhookSvc := service.NewIntercomWebhookService(
+				cfg.Intercom.WebhookSecret,
+				intercomSyncSvc,
+				mergeSvc,
+				connRepo,
+				intercomContactRepo,
+				intercomConversationRepo,
+				eventRepo,
+			)
+
+			onboardingSvc := service.NewOnboardingService(onboardingStatusRepo, onboardingEventRepo)
+
+			// Health scoring engine
+			scoringConfigRepo := repository.NewScoringConfigRepository(pool.P)
+			healthScoreRepo := repository.NewHealthScoreRepository(pool.P)
+
+			paymentRecencyFactor := scoring.NewPaymentRecencyFactor(paymentRecencySvc)
+			mrrTrendFactor := scoring.NewMRRTrendFactor(customerRepo, eventRepo)
+			failedPaymentsFactor := scoring.NewFailedPaymentsFactor(paymentHealthSvc, paymentRepo)
+			supportTicketsFactor := scoring.NewSupportTicketsFactor(eventRepo)
+			engagementFactor := scoring.NewEngagementFactor(eventRepo)
+
+			scoreAggregator := scoring.NewScoreAggregator(
+				[]scoring.ScoreFactor{
+					paymentRecencyFactor,
+					mrrTrendFactor,
+					failedPaymentsFactor,
+					supportTicketsFactor,
+					engagementFactor,
+				},
+				scoringConfigRepo,
+			)
+
+			changeDetector := scoring.NewChangeDetector(eventRepo, cfg.Scoring.ChangeDelta)
+			riskCategorizer := scoring.NewRiskCategorizer(healthScoreRepo)
+
+			scoreScheduler := scoring.NewScoreScheduler(
+				scoreAggregator, healthScoreRepo, customerRepo, connRepo, changeDetector,
+				time.Duration(cfg.Scoring.RecalcIntervalMin)*time.Minute,
+				cfg.Scoring.Workers,
+			)
+
+			scoringConfigSvc := scoring.NewConfigService(scoringConfigRepo, scoreScheduler)
+
+			// Alert engine + scheduler
+			alertRuleRepo := repository.NewAlertRuleRepository(pool.P)
+			alertHistoryRepo := repository.NewAlertHistoryRepository(pool.P)
+			emailTemplateSvc, err := service.NewEmailTemplateService()
+			if err != nil {
+				slog.Error("failed to initialize email templates", "error", err)
+				os.Exit(1)
+			}
+
+			alertEngine := service.NewAlertEngine(
+				alertRuleRepo, alertHistoryRepo, healthScoreRepo,
+				customerRepo, eventRepo, cfg.Alert.DefaultCooldownHr,
+			)
+
+			notifPrefRepo := repository.NewNotificationPreferenceRepository(pool.P)
+			notifPrefSvc := service.NewNotificationPreferenceService(notifPrefRepo)
+
+			alertScheduler := service.NewAlertScheduler(
+				service.AlertSchedulerDeps{
+					Engine:       alertEngine,
+					EmailService: emailSvc,
+					Templates:    emailTemplateSvc,
+					AlertHistory: alertHistoryRepo,
+					AlertRules:   alertRuleRepo,
+					UserRepo:     userRepo,
+					NotifPrefSvc: notifPrefSvc,
+				},
+				cfg.Alert.EvalIntervalMin,
+				cfg.SendGrid.FrontendURL,
+			)
+
+			// Wire in-app notifications into the alert scheduler
+			notifRepo := repository.NewNotificationRepository(pool.P)
+			notifSvc := service.NewNotificationService(notifRepo, userRepo, notifPrefSvc)
+			alertScheduler.SetNotificationService(notifSvc)
+
+			// Hook real-time alert evaluation into score recalculation
+			scoreScheduler.SetAlertCallback(func(ctx context.Context, customerID, orgID uuid.UUID) {
+				matches, err := alertEngine.EvaluateForCustomer(ctx, customerID, orgID)
+				if err != nil {
+					slog.Error("real-time alert eval error", "customer_id", customerID, "error", err)
+					return
+				}
+				for _, match := range matches {
+					alertScheduler.ProcessMatch(ctx, match)
+				}
+			})
+
+			// Start background services
+			bgCtx, bgCancel := context.WithCancel(context.Background())
+			defer bgCancel()
+
+			if cfg.Stripe.SyncIntervalMin > 0 {
+				syncScheduler := service.NewSyncSchedulerService(
+					connRepo,
+					syncOrchestrator,
+					hubspotSyncOrchestrator,
+					intercomSyncOrchestrator,
+					cfg.Stripe.SyncIntervalMin,
+				)
+				go syncScheduler.Start(bgCtx)
+			}
+
+			if cfg.Scoring.RecalcIntervalMin > 0 {
+				go scoreScheduler.Start(bgCtx)
+			}
+
+			connMonitor := service.NewConnectionMonitorService(
+				connRepo,
+				stripeOAuthSvc,
+				hubspotOAuthSvc,
+				hubspotClient,
+				intercomOAuthSvc,
+				intercomClient,
+				connectionMonitorIntervalSeconds,
+			)
+			go connMonitor.Start(bgCtx)
+
+			if cfg.Alert.EvalIntervalMin > 0 {
+				go alertScheduler.Start(bgCtx)
+			}
+
+			r.Post("/auth/register", authHandler.Register)
+			r.Post("/auth/login", authHandler.Login)
+			r.Post("/auth/refresh", authHandler.Refresh)
+			r.Post("/auth/password-reset/request", authHandler.RequestPasswordReset)
+			r.Post("/auth/password-reset/complete", authHandler.CompletePasswordReset)
+
+			// Invitation acceptance (public — no auth required)
+			r.Post("/invitations/accept", invitationHandler.Accept)
+
+			// Stripe webhook (public — verified by signature)
+			webhookHandler := handler.NewWebhookStripeHandler(stripeWebhookSvc)
+			r.Post("/webhooks/stripe", webhookHandler.HandleWebhook)
+
+			// Stripe billing webhook (public — verified by signature)
+			billingWebhookHandler := handler.NewWebhookStripeBillingHandler(billingWebhookSvc)
+			r.Post("/webhooks/stripe-billing", billingWebhookHandler.HandleWebhook)
+
+			// SendGrid webhook (public — for delivery tracking)
+			sendgridWebhookHandler := handler.NewWebhookSendGridHandler(alertHistoryRepo)
+			r.Post("/webhooks/sendgrid", sendgridWebhookHandler.HandleWebhook)
+
+			// HubSpot webhook (public — verified by signature)
+			hubspotWebhookHandler := handler.NewWebhookHubSpotHandler(hubspotWebhookSvc)
+			r.Post("/webhooks/hubspot", hubspotWebhookHandler.HandleWebhook)
+
+			// Intercom webhook (public — verified by signature)
+			intercomWebhookHandler := handler.NewWebhookIntercomHandler(intercomWebhookSvc)
+			r.Post("/webhooks/intercom", intercomWebhookHandler.HandleWebhook)
+
+			// Protected routes (JWT required)
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.JWTAuth(jwtMgr))
+				r.Use(middleware.TenantIsolation(orgRepo))
+
+				// Organization routes
+				orgSvc := service.NewOrganizationService(pool.P, orgRepo)
+				orgHandler := handler.NewOrganizationHandler(orgSvc)
+				r.Post("/organizations", orgHandler.Create)
+				r.Get("/organizations/current", orgHandler.GetCurrent)
+				r.Patch("/organizations/current", orgHandler.UpdateCurrent)
+
+				billingHandler := handler.NewBillingHandler(
+					billingCheckoutSvc,
+					billingPortalSvc,
+					billingSubscriptionSvc,
+				)
+				r.Route("/billing", func(r chi.Router) {
+					r.Get("/subscription", billingHandler.GetSubscription)
+					r.Group(func(r chi.Router) {
+						r.Use(middleware.RequireRole("admin"))
+						r.Post("/checkout", billingHandler.CreateCheckout)
+						r.Post("/portal-session", billingHandler.CreatePortalSession)
+						r.Post("/cancel", billingHandler.CancelSubscription)
+					})
+				})
+
+				// User profile routes
+				userSvc := service.NewUserService(userRepo, orgRepo)
+				userHandler := handler.NewUserHandler(userSvc)
+				r.Get("/users/me", userHandler.GetProfile)
+				r.Patch("/users/me", userHandler.UpdateProfile)
+
+				// Customer routes
+				customerSvc := service.NewCustomerService(customerRepo, healthScoreRepo, subRepo, eventRepo)
+				customerHandler := handler.NewCustomerHandler(customerSvc)
+				r.Get("/customers", customerHandler.List)
+				r.Get("/customers/{id}", customerHandler.GetDetail)
+				r.Get("/customers/{id}/events", customerHandler.ListEvents)
+
+				// Dashboard routes
+				dashboardSvc := service.NewDashboardService(customerRepo, healthScoreRepo)
+				dashboardHandler := handler.NewDashboardHandler(dashboardSvc)
+				r.Get("/dashboard/summary", dashboardHandler.GetSummary)
+				r.Get("/dashboard/score-distribution", dashboardHandler.GetScoreDistribution)
+
+				// Integration management routes (admin+ required)
+				integrationSvc := service.NewIntegrationService(connRepo, stripeOAuthSvc, syncOrchestrator)
+				integrationHandler := handler.NewIntegrationHandler(integrationSvc)
+				r.Route("/integrations", func(r chi.Router) {
+					r.Get("/", integrationHandler.List)
+					r.Route("/{provider}", func(r chi.Router) {
+						r.Use(middleware.RequireRole("admin"))
+						r.Get("/status", integrationHandler.GetStatus)
+						r.Post("/sync", integrationHandler.TriggerSync)
+						r.Delete("/", integrationHandler.Disconnect)
+					})
+				})
+
+				// Member management routes (admin+ required)
+				memberSvc := service.NewMemberService(orgRepo)
+				memberHandler := handler.NewMemberHandler(memberSvc)
+				r.Get("/members", memberHandler.List)
+				r.Route("/members/{id}", func(r chi.Router) {
+					r.Use(middleware.RequireRole("admin"))
+					r.Patch("/role", memberHandler.UpdateRole)
+					r.Delete("/", memberHandler.Remove)
+				})
+
+				// Invitation routes (admin+ required)
+				r.Route("/invitations", func(r chi.Router) {
+					r.Use(middleware.RequireRole("admin"))
+					r.Post("/", invitationHandler.Create)
+					r.Get("/", invitationHandler.List)
+					r.Delete("/{id}", invitationHandler.Revoke)
+				})
+
+				// Notification preferences routes
+				notifPrefHandler := handler.NewNotificationPreferenceHandler(notifPrefSvc)
+				r.Get("/notifications/preferences", notifPrefHandler.Get)
+				r.Patch("/notifications/preferences", notifPrefHandler.Update)
+
+				// Notification routes
+				notifHandler := handler.NewNotificationHandler(notifSvc)
+				r.Get("/notifications", notifHandler.List)
+				r.Get("/notifications/unread-count", notifHandler.CountUnread)
+				r.Post("/notifications/{id}/read", notifHandler.MarkRead)
+				r.Post("/notifications/read-all", notifHandler.MarkAllRead)
+
+				// Alert rule routes (admin+ required)
+				alertRuleSvc := service.NewAlertRuleService(alertRuleRepo)
+				alertRuleHandler := handler.NewAlertRuleHandler(alertRuleSvc)
+				alertHistoryHandler := handler.NewAlertHistoryHandler(alertHistoryRepo)
+				r.Route("/alerts/rules", func(r chi.Router) {
+					r.Use(middleware.RequireRole("admin"))
+					r.Get("/", alertRuleHandler.List)
+					r.Post("/", alertRuleHandler.Create)
+					r.Get("/{id}", alertRuleHandler.Get)
+					r.Patch("/{id}", alertRuleHandler.Update)
+					r.Delete("/{id}", alertRuleHandler.Delete)
+					r.Get("/{id}/history", alertHistoryHandler.ListByRule)
+				})
+
+				// Alert history routes
+				r.Get("/alerts/history", alertHistoryHandler.List)
+				r.Get("/alerts/stats", alertHistoryHandler.Stats)
+
+				// Stripe integration routes (admin+ required)
+				stripeHandler := handler.NewIntegrationStripeHandler(stripeOAuthSvc, syncOrchestrator)
+				r.Route("/integrations/stripe", func(r chi.Router) {
+					r.Use(middleware.RequireRole("admin"))
+					r.With(middleware.RequireIntegrationLimit(billingLimitsSvc, "stripe")).Get("/connect", stripeHandler.Connect)
+					r.Get("/callback", stripeHandler.Callback)
+					r.Get("/status", stripeHandler.Status)
+					r.Delete("/", stripeHandler.Disconnect)
+					r.Post("/sync", stripeHandler.TriggerSync)
+				})
+
+				// HubSpot integration routes (admin+ required)
+				hubspotHandler := handler.NewIntegrationHubSpotHandler(hubspotOAuthSvc, hubspotSyncOrchestrator)
+				r.Route("/integrations/hubspot", func(r chi.Router) {
+					r.Use(middleware.RequireRole("admin"))
+					r.With(middleware.RequireIntegrationLimit(billingLimitsSvc, "hubspot")).Get("/connect", hubspotHandler.Connect)
+					r.Get("/callback", hubspotHandler.Callback)
+					r.Get("/status", hubspotHandler.Status)
+					r.Delete("/", hubspotHandler.Disconnect)
+					r.Post("/sync", hubspotHandler.TriggerSync)
+				})
+
+				// Intercom integration routes (admin+ required)
+				intercomHandler := handler.NewIntegrationIntercomHandler(intercomOAuthSvc, intercomSyncOrchestrator)
+				r.Route("/integrations/intercom", func(r chi.Router) {
+					r.Use(middleware.RequireRole("admin"))
+					r.With(middleware.RequireIntegrationLimit(billingLimitsSvc, "intercom")).Get("/connect", intercomHandler.Connect)
+					r.Get("/callback", intercomHandler.Callback)
+					r.Get("/status", intercomHandler.Status)
+					r.Delete("/", intercomHandler.Disconnect)
+					r.Post("/sync", intercomHandler.TriggerSync)
+				})
+
+				// Onboarding routes
+				onboardingHandler := handler.NewOnboardingHandler(onboardingSvc)
+				r.Route("/onboarding", func(r chi.Router) {
+					r.Get("/status", onboardingHandler.GetStatus)
+					r.Patch("/status", onboardingHandler.UpdateStatus)
+					r.Post("/complete", onboardingHandler.Complete)
+					r.Post("/reset", onboardingHandler.Reset)
+					r.Get("/analytics", onboardingHandler.Analytics)
+				})
+
+				// Health scoring routes
+				scoringHandler := handler.NewScoringHandler(scoringConfigSvc, riskCategorizer, scoreScheduler)
+				r.Route("/scoring", func(r chi.Router) {
+					r.Get("/risk-distribution", scoringHandler.GetRiskDistribution)
+					r.Get("/histogram", scoringHandler.GetScoreHistogram)
+					r.Post("/customers/{id}/recalculate", scoringHandler.RecalculateCustomer)
+					r.Route("/config", func(r chi.Router) {
+						r.Use(middleware.RequireRole("admin"))
+						r.Get("/", scoringHandler.GetConfig)
+						r.Put("/", scoringHandler.UpdateConfig)
+					})
+				})
+			})
+		}
+	})
+}
+
+func newHTTPServer(cfg *config.Config, handler http.Handler) *http.Server {
+	addr := fmt.Sprintf("%s:%s", cfg.Server.Host, cfg.Server.Port)
+	return &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
+	}
+}
+
+func runServerWithGracefulShutdown(srv *http.Server, environment string) {
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		slog.Info("starting PulseScore API", "addr", srv.Addr, "env", environment)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-done
+	slog.Info("shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("server forced to shutdown", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("server stopped")
+}
