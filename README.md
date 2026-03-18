@@ -1,6 +1,6 @@
-# PulseScore
+# Galdr
 
-PulseScore is a full-stack SaaS application for B2B customer health monitoring. It brings together billing, CRM, and support signals from Stripe, HubSpot, and Intercom so teams can identify at-risk accounts earlier and make better retention decisions.
+Galdr is a full-stack SaaS application for B2B customer health monitoring. It brings together billing, CRM, and support signals from Stripe, HubSpot, and Intercom so teams can identify at-risk accounts earlier and make better retention decisions.
 
 ## Why this project is a strong portfolio piece
 
