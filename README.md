@@ -20,6 +20,12 @@ PulseScore is a full-stack SaaS application for B2B customer health monitoring. 
 
 This project demonstrates the ability to design and ship a polished, end-to-end SaaS platform: backend services, frontend experience, external integrations, billing, deployment, and ongoing maintainability.
 
+## Prerequisites
+
+- Go 1.24+
+- Node.js 20+
+- Docker and Docker Compose
+
 ## Quick start
 
 ```bash
@@ -42,3 +48,5 @@ npm run dev
 make lint test
 cd web && npm run lint && npm run format:check
 ```
+
+For deeper implementation and operational details, see `./Makefile`, `./docs`, and `./.github/workflows`.
