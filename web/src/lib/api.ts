@@ -339,6 +339,56 @@ export const alertsApi = {
     ),
 };
 
+export type PlaybookTriggerType =
+  | "score_threshold"
+  | "customer_event"
+  | "schedule";
+
+export type PlaybookActionType =
+  | "send_email"
+  | "internal_alert"
+  | "tag_customer"
+  | "webhook";
+
+export interface PlaybookActionPayload {
+  action_type: PlaybookActionType;
+  action_config: Record<string, unknown>;
+}
+
+export interface CreatePlaybookPayload {
+  name: string;
+  description: string;
+  trigger_type: PlaybookTriggerType;
+  trigger_config: Record<string, unknown>;
+  actions: PlaybookActionPayload[];
+}
+
+export interface PlaybookAction extends PlaybookActionPayload {
+  id?: string;
+  playbook_id?: string;
+  order_index: number;
+}
+
+export interface Playbook {
+  id: string;
+  org_id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  trigger_type: PlaybookTriggerType;
+  trigger_config: Record<string, unknown>;
+  actions: PlaybookAction[];
+  created_at: string;
+  updated_at: string;
+}
+
+export const playbooksApi = {
+  list: () => api.get<{ playbooks: Playbook[] }>("/playbooks"),
+
+  create: (data: CreatePlaybookPayload) =>
+    api.post<{ playbook: Playbook }>("/playbooks", data),
+};
+
 export interface SavedViewFilters {
   search?: string;
   risk_level?: string;
