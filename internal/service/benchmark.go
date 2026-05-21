@@ -179,13 +179,13 @@ type BenchmarkComparisonResponse struct {
 }
 
 type BenchmarkMetricResponse struct {
-	Key         string                 `json:"key"`
-	Label       string                 `json:"label"`
-	Unit        string                 `json:"unit"`
-	YourValue   float64                `json:"your_value"`
-	Percentile  *float64               `json:"percentile"`
-	Benchmarks  *BenchmarkPercentiles  `json:"benchmarks"`
-	SampleCount int                    `json:"sample_count"`
+	Key         string                `json:"key"`
+	Label       string                `json:"label"`
+	Unit        string                `json:"unit"`
+	YourValue   float64               `json:"your_value"`
+	Percentile  *float64              `json:"percentile"`
+	Benchmarks  *BenchmarkPercentiles `json:"benchmarks"`
+	SampleCount int                   `json:"sample_count"`
 }
 
 type BenchmarkPercentiles struct {
@@ -372,14 +372,14 @@ func floatPtr(value float64) *float64 {
 }
 
 const (
-	benchmarkMinimumSampleSize         = 5
+	benchmarkMinimumSampleSize           = 5
 	benchmarkContributionFreshnessWindow = 30 * 24 * time.Hour
-	benchmarkQualityTargetSampleSize   = 20
-	benchmarkQualitySampleWeight       = 0.5
-	benchmarkQualityRecencyWeight      = 0.3
-	benchmarkQualityVarianceWeight     = 0.2
-	benchmarkQualityHighThreshold      = 80
-	benchmarkQualityMediumThreshold    = 60
+	benchmarkQualityTargetSampleSize     = 20
+	benchmarkQualitySampleWeight         = 0.5
+	benchmarkQualityRecencyWeight        = 0.3
+	benchmarkQualityVarianceWeight       = 0.2
+	benchmarkQualityHighThreshold        = 80
+	benchmarkQualityMediumThreshold      = 60
 )
 
 const (
@@ -428,9 +428,9 @@ func (s *BenchmarkAggregationService) RunOnce(ctx context.Context) error {
 }
 
 type benchmarkSegment struct {
-	industry            string
-	companySizeBucket   string
-	contributions       []repository.BenchmarkContribution
+	industry          string
+	companySizeBucket string
+	contributions     []repository.BenchmarkContribution
 }
 
 type benchmarkSegmentKey struct {
@@ -683,20 +683,20 @@ type BenchmarkEmailSender interface {
 
 type BenchmarkInsightNotificationDeps struct {
 	Contributions BenchmarkContributionPairReader
-	Aggregates     BenchmarkInsightAggregateReader
-	Members        BenchmarkMemberReader
-	Notifications  BenchmarkNotificationWriter
-	Preferences    BenchmarkPreferenceReader
-	Emails         BenchmarkEmailSender
+	Aggregates    BenchmarkInsightAggregateReader
+	Members       BenchmarkMemberReader
+	Notifications BenchmarkNotificationWriter
+	Preferences   BenchmarkPreferenceReader
+	Emails        BenchmarkEmailSender
 }
 
 type BenchmarkInsightNotificationService struct {
 	contributions BenchmarkContributionPairReader
-	aggregates     BenchmarkInsightAggregateReader
-	members        BenchmarkMemberReader
-	notifications  BenchmarkNotificationWriter
-	preferences    BenchmarkPreferenceReader
-	emails         BenchmarkEmailSender
+	aggregates    BenchmarkInsightAggregateReader
+	members       BenchmarkMemberReader
+	notifications BenchmarkNotificationWriter
+	preferences   BenchmarkPreferenceReader
+	emails        BenchmarkEmailSender
 }
 
 type BenchmarkWeeklyDigestSummary struct {
@@ -720,11 +720,11 @@ type benchmarkInsight struct {
 func NewBenchmarkInsightNotificationService(deps BenchmarkInsightNotificationDeps) *BenchmarkInsightNotificationService {
 	return &BenchmarkInsightNotificationService{
 		contributions: deps.Contributions,
-		aggregates:     deps.Aggregates,
-		members:        deps.Members,
-		notifications:  deps.Notifications,
-		preferences:    deps.Preferences,
-		emails:         deps.Emails,
+		aggregates:    deps.Aggregates,
+		members:       deps.Members,
+		notifications: deps.Notifications,
+		preferences:   deps.Preferences,
+		emails:        deps.Emails,
 	}
 }
 
@@ -911,8 +911,8 @@ func benchmarkDigestSummaryFromPair(pair repository.BenchmarkContributionPair, a
 	return BenchmarkWeeklyDigestSummary{
 		OrgID:              pair.Current.OrgID,
 		MetricName:         repository.BenchmarkMetricHealthScore,
-		PreviousPercentile: benchmarkPosition(pair.Previous.AvgHealthScore, aggregate),
-		CurrentPercentile:  benchmarkPosition(pair.Current.AvgHealthScore, aggregate),
+		PreviousPercentile: benchmarkBucketPosition(pair.Previous.AvgHealthScore, aggregate),
+		CurrentPercentile:  benchmarkBucketPosition(pair.Current.AvgHealthScore, aggregate),
 	}, true
 }
 
@@ -932,8 +932,8 @@ func benchmarkContributionMetrics(previous, current repository.BenchmarkContribu
 }
 
 func benchmarkInsightFromMetric(orgID uuid.UUID, metric benchmarkContributionMetric, aggregate repository.BenchmarkAggregate) (benchmarkInsight, bool) {
-	previousPercentile := benchmarkPosition(metric.previous, aggregate)
-	currentPercentile := benchmarkPosition(metric.current, aggregate)
+	previousPercentile := benchmarkBucketPosition(metric.previous, aggregate)
+	currentPercentile := benchmarkBucketPosition(metric.current, aggregate)
 	switch {
 	case metric.previous >= aggregate.P50 && metric.current < aggregate.P50:
 		return benchmarkInsight{
@@ -960,7 +960,7 @@ func benchmarkInsightFromMetric(orgID uuid.UUID, metric benchmarkContributionMet
 	}
 }
 
-func benchmarkPosition(value float64, aggregate repository.BenchmarkAggregate) float64 {
+func benchmarkBucketPosition(value float64, aggregate repository.BenchmarkAggregate) float64 {
 	switch {
 	case value < aggregate.P25:
 		return 10

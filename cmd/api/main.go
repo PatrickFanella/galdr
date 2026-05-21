@@ -478,6 +478,14 @@ func registerAPIRoutes(r *chi.Mux, cfg *config.Config, pool *database.Pool, jwtM
 				Playbooks:  playbookRepo,
 				Executions: playbookExecutionRepo,
 			})
+			customerEventTriggerSvc := service.NewPlaybookCustomerEventTriggerService(playbookRepo, playbookExecutionRepo)
+			eventRepo.SetAfterUpsert(func(ctx context.Context, event *repository.CustomerEvent) error {
+				if err := customerEventTriggerSvc.EvaluateCustomerEvent(ctx, event); err != nil {
+					slog.Error("customer-event playbook trigger error", "customer_id", event.CustomerID, "event_type", event.EventType, "error", err)
+					return err
+				}
+				return nil
+			})
 
 			// Alert engine + scheduler
 			alertRuleRepo := repository.NewAlertRuleRepository(pool.P)
@@ -579,11 +587,11 @@ func registerAPIRoutes(r *chi.Mux, cfg *config.Config, pool *database.Pool, jwtM
 				benchmarkAggregation := service.NewBenchmarkAggregationService(benchmarkRepo, benchmarkRepo)
 				benchmarkNotifications := service.NewBenchmarkInsightNotificationService(service.BenchmarkInsightNotificationDeps{
 					Contributions: benchmarkRepo,
-					Aggregates:     benchmarkRepo,
-					Members:        orgRepo,
-					Notifications:  notifRepo,
-					Preferences:    notifPrefSvc,
-					Emails:         emailSvc,
+					Aggregates:    benchmarkRepo,
+					Members:       orgRepo,
+					Notifications: notifRepo,
+					Preferences:   notifPrefSvc,
+					Emails:        emailSvc,
 				})
 				benchmarkWorkflow := service.NewBenchmarkWorkflow(benchmarkPipeline, benchmarkAggregation, benchmarkNotifications)
 				benchmarkScheduler := service.NewBenchmarkScheduler(benchmarkWorkflow, time.Duration(cfg.Benchmark.ContributionIntervalHr)*time.Hour)
