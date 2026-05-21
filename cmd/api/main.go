@@ -192,6 +192,7 @@ func registerAPIRoutes(r *chi.Mux, cfg *config.Config, pool *database.Pool, jwtM
 				OAuthRedirectURL: cfg.Stripe.OAuthRedirectURL,
 				EncryptionKey:    cfg.Stripe.EncryptionKey,
 			}, connRepo)
+			stripeAppInstallSvc := service.NewStripeAppInstallService(authSvc, stripeOAuthSvc, connRepo)
 
 			hubspotOAuthSvc := service.NewHubSpotOAuthService(service.HubSpotOAuthConfig{
 				ClientID:         cfg.HubSpot.ClientID,
@@ -311,6 +312,7 @@ func registerAPIRoutes(r *chi.Mux, cfg *config.Config, pool *database.Pool, jwtM
 				connRepo, customerRepo, subRepo, paymentRepo, eventRepo,
 				mrrSvc, paymentHealthSvc,
 			)
+			stripeWebhookSvc.SetAppInstallService(stripeAppInstallSvc)
 
 			billingSubscriptionSvc := billingsvc.NewSubscriptionService(
 				orgSubRepo,
@@ -579,11 +581,11 @@ func registerAPIRoutes(r *chi.Mux, cfg *config.Config, pool *database.Pool, jwtM
 				benchmarkAggregation := service.NewBenchmarkAggregationService(benchmarkRepo, benchmarkRepo)
 				benchmarkNotifications := service.NewBenchmarkInsightNotificationService(service.BenchmarkInsightNotificationDeps{
 					Contributions: benchmarkRepo,
-					Aggregates:     benchmarkRepo,
-					Members:        orgRepo,
-					Notifications:  notifRepo,
-					Preferences:    notifPrefSvc,
-					Emails:         emailSvc,
+					Aggregates:    benchmarkRepo,
+					Members:       orgRepo,
+					Notifications: notifRepo,
+					Preferences:   notifPrefSvc,
+					Emails:        emailSvc,
 				})
 				benchmarkWorkflow := service.NewBenchmarkWorkflow(benchmarkPipeline, benchmarkAggregation, benchmarkNotifications)
 				benchmarkScheduler := service.NewBenchmarkScheduler(benchmarkWorkflow, time.Duration(cfg.Benchmark.ContributionIntervalHr)*time.Hour)
@@ -611,6 +613,11 @@ func registerAPIRoutes(r *chi.Mux, cfg *config.Config, pool *database.Pool, jwtM
 			// Stripe webhook (public — verified by signature)
 			webhookHandler := handler.NewWebhookStripeHandler(stripeWebhookSvc)
 			r.Post("/webhooks/stripe", webhookHandler.HandleWebhook)
+
+			// Stripe App Marketplace install (public — continues into OAuth)
+			stripeAppHandler := handler.NewStripeAppHandler(stripeAppInstallSvc)
+			r.Get("/stripe-app/install", stripeAppHandler.Install)
+			r.Post("/stripe-app/install", stripeAppHandler.Install)
 
 			// Stripe billing webhook (public — verified by signature)
 			billingWebhookHandler := handler.NewWebhookStripeBillingHandler(billingWebhookSvc)

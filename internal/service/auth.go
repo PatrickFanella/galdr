@@ -45,6 +45,12 @@ type AuthResponse struct {
 	Tokens       *auth.TokenPair `json:"tokens"`
 }
 
+// MarketplaceAccountResponse is returned when a marketplace install resolves a PulseScore account.
+type MarketplaceAccountResponse struct {
+	AuthResponse
+	Created bool `json:"created"`
+}
+
 // AuthUser is the user portion of an auth response.
 type AuthUser struct {
 	ID        uuid.UUID `json:"id"`
@@ -208,7 +214,7 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 	return &AuthResponse{
 		User:         authUserResponse(user),
 		Organization: authOrgResponse(org, "owner"),
-		Tokens: tokens,
+		Tokens:       tokens,
 	}, nil
 }
 
@@ -291,8 +297,95 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*AuthRespons
 	return &AuthResponse{
 		User:         authUserResponse(user),
 		Organization: authOrgResponse(orgDetails, defaultOrg.Role),
-		Tokens: tokens,
+		Tokens:       tokens,
 	}, nil
+}
+
+// EnsureMarketplaceAccount returns an existing account by email or creates one for a marketplace install.
+func (s *AuthService) EnsureMarketplaceAccount(ctx context.Context, email, orgName string) (*MarketplaceAccountResponse, error) {
+	email = strings.TrimSpace(email)
+	if err := validateEmail(email); err != nil {
+		return nil, &ValidationError{Field: "email", Message: err.Error()}
+	}
+
+	user, err := s.users.GetByEmail(ctx, email)
+	if err != nil {
+		return nil, fmt.Errorf("get marketplace user: %w", err)
+	}
+	if user != nil {
+		response, err := s.authResponseForUser(ctx, user)
+		if err != nil {
+			return nil, err
+		}
+		return &MarketplaceAccountResponse{AuthResponse: *response, Created: false}, nil
+	}
+
+	password, err := marketplaceInstallPassword()
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(orgName) == "" {
+		orgName = marketplaceOrgName(email)
+	}
+	response, err := s.Register(ctx, RegisterRequest{
+		Email:     email,
+		Password:  password,
+		FirstName: "",
+		LastName:  "",
+		OrgName:   orgName,
+		Industry:  "Other",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &MarketplaceAccountResponse{AuthResponse: *response, Created: true}, nil
+}
+
+func (s *AuthService) authResponseForUser(ctx context.Context, user *repository.User) (*AuthResponse, error) {
+	orgs, err := s.users.GetUserOrgs(ctx, user.ID)
+	if err != nil {
+		return nil, fmt.Errorf("get user orgs: %w", err)
+	}
+	if len(orgs) == 0 {
+		return nil, fmt.Errorf("user has no organizations")
+	}
+	defaultOrg := orgs[0]
+	orgDetails, err := s.orgs.GetByID(ctx, defaultOrg.OrgID)
+	if err != nil {
+		return nil, fmt.Errorf("get org: %w", err)
+	}
+	if orgDetails == nil {
+		return nil, fmt.Errorf("organization not found")
+	}
+	tokens, err := s.jwtMgr.GenerateTokenPair(user.ID, defaultOrg.OrgID, defaultOrg.Role)
+	if err != nil {
+		return nil, fmt.Errorf("generate tokens: %w", err)
+	}
+	if err := s.storeRefreshToken(ctx, user.ID, tokens.RefreshToken); err != nil {
+		return nil, fmt.Errorf("store refresh token: %w", err)
+	}
+	return &AuthResponse{
+		User:         authUserResponse(user),
+		Organization: authOrgResponse(orgDetails, defaultOrg.Role),
+		Tokens:       tokens,
+	}, nil
+}
+
+func marketplaceInstallPassword() (string, error) {
+	token, err := generateSecureToken(18)
+	if err != nil {
+		return "", fmt.Errorf("generate marketplace account password: %w", err)
+	}
+	return "StripeApp1" + token, nil
+}
+
+func marketplaceOrgName(email string) string {
+	local := strings.SplitN(email, "@", 2)[0]
+	local = strings.TrimSpace(strings.ReplaceAll(local, ".", " "))
+	if local == "" {
+		return "Stripe Marketplace Account"
+	}
+	return local + " Workspace"
 }
 
 func validateEmail(email string) error {
@@ -410,7 +503,7 @@ func (s *AuthService) Refresh(ctx context.Context, req RefreshRequest) (*AuthRes
 	return &AuthResponse{
 		User:         authUserResponse(user),
 		Organization: authOrgResponse(orgDetails, defaultOrg.Role),
-		Tokens: tokens,
+		Tokens:       tokens,
 	}, nil
 }
 

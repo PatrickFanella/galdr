@@ -179,6 +179,16 @@ func (r *IntegrationConnectionRepository) Delete(ctx context.Context, orgID uuid
 	return nil
 }
 
+// DeleteByProviderAndExternalID removes a connection by provider and external account ID.
+func (r *IntegrationConnectionRepository) DeleteByProviderAndExternalID(ctx context.Context, provider, externalAccountID string) error {
+	query := `DELETE FROM integration_connections WHERE provider = $1 AND external_account_id = $2`
+	_, err := r.pool.Exec(ctx, query, provider, externalAccountID)
+	if err != nil {
+		return fmt.Errorf("delete connection by external id: %w", err)
+	}
+	return nil
+}
+
 // UpdateErrorCount increments error tracking for a connection identified by org+provider.
 func (r *IntegrationConnectionRepository) UpdateErrorCount(ctx context.Context, orgID uuid.UUID, provider, lastError string) error {
 	query := `
