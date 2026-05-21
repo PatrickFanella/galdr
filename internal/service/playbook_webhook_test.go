@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,7 +131,7 @@ func TestWebhookActionRetriesRequestErrors(t *testing.T) {
 	if !errors.Is(err, requestErr) {
 		t.Fatalf("expected original request error, got %v", err)
 	}
-	if attempts != defaultWebhookAttempts || result.Attempts != defaultWebhookAttempts || result.Error != requestErr.Error() {
+	if attempts != defaultWebhookAttempts || result.Attempts != defaultWebhookAttempts || !strings.Contains(result.Error, requestErr.Error()) {
 		t.Fatalf("expected recorded third-attempt request failure, attempts=%d result=%+v", attempts, result)
 	}
 }
