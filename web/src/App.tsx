@@ -20,6 +20,10 @@ const DashboardPage = lazy(() => import("@/pages/DashboardPage"));
 const CustomersPage = lazy(() => import("@/pages/CustomersPage"));
 const BenchmarkPage = lazy(() => import("@/pages/BenchmarkPage"));
 const IntegrationHealthPage = lazy(() => import("@/pages/IntegrationHealthPage"));
+const PlaybooksPage = lazy(() => import("@/pages/PlaybooksPage"));
+const PlaybookBuilderPage = lazy(
+  () => import("@/pages/PlaybookBuilderPage"),
+);
 const CustomerDetailPage = lazy(() => import("@/pages/CustomerDetailPage"));
 const MarketplacePage = lazy(() => import("@/pages/MarketplacePage"));
 const ConnectorDetailPage = lazy(() => import("@/pages/ConnectorDetailPage"));
@@ -137,6 +141,11 @@ function App() {
                       <Route
                         path="/integration-health"
                         element={<IntegrationHealthPage />}
+                      />
+                      <Route path="/playbooks" element={<PlaybooksPage />} />
+                      <Route
+                        path="/playbooks/new"
+                        element={<PlaybookBuilderPage />}
                       />
                       <Route
                         path="/customers/:id"
