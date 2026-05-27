@@ -22,10 +22,10 @@ import (
 
 // StripeOAuthConfig holds Stripe OAuth settings.
 type StripeOAuthConfig struct {
-	ClientID       string
-	SecretKey      string
+	ClientID         string
+	SecretKey        string
 	OAuthRedirectURL string
-	EncryptionKey  string // 32-byte hex-encoded AES key
+	EncryptionKey    string // 32-byte hex-encoded AES key
 }
 
 // StripeOAuthService handles Stripe OAuth connect flow.
@@ -48,11 +48,11 @@ func (s *StripeOAuthService) ConnectURL(orgID uuid.UUID) (string, error) {
 	state := fmt.Sprintf("%s:%d", orgID.String(), time.Now().UnixNano())
 
 	params := url.Values{
-		"response_type": {"code"},
-		"client_id":     {s.cfg.ClientID},
-		"scope":         {"read_only"},
-		"redirect_uri":  {s.cfg.OAuthRedirectURL},
-		"state":         {state},
+		"response_type":  {"code"},
+		"client_id":      {s.cfg.ClientID},
+		"scope":          {"read_only"},
+		"redirect_uri":   {s.cfg.OAuthRedirectURL},
+		"state":          {state},
 		"stripe_landing": {"login"},
 	}
 
@@ -141,6 +141,15 @@ func (s *StripeOAuthService) GetStatus(ctx context.Context, orgID uuid.UUID) (*S
 // Disconnect removes a Stripe connection.
 func (s *StripeOAuthService) Disconnect(ctx context.Context, orgID uuid.UUID) error {
 	return s.connRepo.Delete(ctx, orgID, "stripe")
+}
+
+// DisconnectByStripeAccount removes a Stripe connection by external Stripe account ID.
+func (s *StripeOAuthService) DisconnectByStripeAccount(ctx context.Context, stripeAccountID string) error {
+	stripeAccountID = strings.TrimSpace(stripeAccountID)
+	if stripeAccountID == "" {
+		return &ValidationError{Field: "stripe_account_id", Message: "stripe account id is required"}
+	}
+	return s.connRepo.DeleteByProviderAndExternalID(ctx, "stripe", stripeAccountID)
 }
 
 // GetAccessToken retrieves and decrypts the access token for an org's Stripe connection.

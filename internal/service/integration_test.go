@@ -76,13 +76,13 @@ func TestIntegrationServiceHealthFlagsStaleAndErroringConnections(t *testing.T) 
 				},
 			},
 			{
-				OrgID:          orgID,
-				Provider:       "hubspot",
-				Status:         "error",
-				LastSyncAt:     &recentSync,
-				LastSyncError:  "rate limited",
-				CreatedAt:      now.Add(-72 * time.Hour),
-				Metadata:       map[string]any{"error_count": 5, "success_count": 5},
+				OrgID:         orgID,
+				Provider:      "hubspot",
+				Status:        "error",
+				LastSyncAt:    &recentSync,
+				LastSyncError: "rate limited",
+				CreatedAt:     now.Add(-72 * time.Hour),
+				Metadata:      map[string]any{"error_count": 5, "success_count": 5},
 			},
 		},
 		customerCounts: map[string]int{"stripe": 120, "hubspot": 80},
@@ -97,18 +97,23 @@ func TestIntegrationServiceHealthFlagsStaleAndErroringConnections(t *testing.T) 
 	if len(health.Integrations) != 3 {
 		t.Fatalf("expected registry and connected integrations, got %#v", health.Integrations)
 	}
-	stripe := health.Integrations[0]
+	integrationsByProvider := make(map[string]IntegrationHealthSummary, len(health.Integrations))
+	for _, integration := range health.Integrations {
+		integrationsByProvider[integration.Provider] = integration
+	}
+
+	stripe := integrationsByProvider["stripe"]
 	if stripe.Provider != "stripe" || stripe.HealthStatus != "warning" || len(stripe.Alerts) == 0 {
 		t.Fatalf("expected stale stripe warning, got %#v", stripe)
 	}
 	if stripe.RecordsSynced != 120 || stripe.SyncDurationMS != 4300 || len(stripe.SyncHistory) != 1 {
 		t.Fatalf("expected stripe sync metrics, got %#v", stripe)
 	}
-	hubspot := health.Integrations[1]
+	hubspot := integrationsByProvider["hubspot"]
 	if hubspot.Provider != "hubspot" || hubspot.HealthStatus != "down" || hubspot.ErrorRate != 0.5 {
 		t.Fatalf("expected hubspot down with error rate, got %#v", hubspot)
 	}
-	zendesk := health.Integrations[2]
+	zendesk := integrationsByProvider["zendesk"]
 	if zendesk.Provider != "zendesk" || zendesk.HealthStatus != "disconnected" {
 		t.Fatalf("expected disconnected registry connector, got %#v", zendesk)
 	}

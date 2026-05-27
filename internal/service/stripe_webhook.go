@@ -25,10 +25,16 @@ type StripeWebhookService struct {
 	events        *repository.CustomerEventRepository
 	mrrSvc        *MRRService
 	paymentHealth *PaymentHealthService
+	appInstall    *StripeAppInstallService
 
 	// processedEvents tracks recently processed event IDs for idempotency
 	processedEvents map[string]time.Time
 	mu              sync.Mutex
+}
+
+// SetAppInstallService wires Stripe App Marketplace lifecycle handling.
+func (s *StripeWebhookService) SetAppInstallService(appInstall *StripeAppInstallService) {
+	s.appInstall = appInstall
 }
 
 // NewStripeWebhookService creates a new StripeWebhookService.
@@ -74,6 +80,10 @@ func (s *StripeWebhookService) HandleEvent(ctx context.Context, payload []byte, 
 	)
 
 	switch event.Type {
+	case "app.installed":
+		return s.handleAppInstalled(ctx, event)
+	case "app.uninstalled":
+		return s.handleAppUninstalled(ctx, event)
 	case "customer.created", "customer.updated":
 		return s.handleCustomerEvent(ctx, event)
 	case "customer.deleted":
@@ -92,6 +102,46 @@ func (s *StripeWebhookService) HandleEvent(ctx context.Context, payload []byte, 
 
 	s.markProcessed(event.ID)
 	return nil
+}
+
+func (s *StripeWebhookService) handleAppInstalled(ctx context.Context, event stripe.Event) error {
+	if s.appInstall == nil {
+		s.markProcessed(event.ID)
+		return nil
+	}
+	if err := s.appInstall.HandleAppInstalled(ctx, stripeAppEventAccountID(event)); err != nil {
+		return err
+	}
+	s.markProcessed(event.ID)
+	return nil
+}
+
+func (s *StripeWebhookService) handleAppUninstalled(ctx context.Context, event stripe.Event) error {
+	if s.appInstall == nil {
+		s.markProcessed(event.ID)
+		return nil
+	}
+	if err := s.appInstall.HandleAppUninstalled(ctx, stripeAppEventAccountID(event)); err != nil {
+		return err
+	}
+	s.markProcessed(event.ID)
+	return nil
+}
+
+func stripeAppEventAccountID(event stripe.Event) string {
+	if event.Account != "" {
+		return event.Account
+	}
+	var data map[string]any
+	if err := json.Unmarshal(event.Data.Raw, &data); err != nil {
+		return ""
+	}
+	for _, key := range []string{"account", "account_id", "stripe_account_id", "stripe_user_id"} {
+		if value, ok := data[key].(string); ok {
+			return value
+		}
+	}
+	return ""
 }
 
 func (s *StripeWebhookService) isProcessed(eventID string) bool {
@@ -394,7 +444,7 @@ func (s *StripeWebhookService) findOrgForStripeAccount(ctx context.Context, stri
 		}
 	}
 
-	// If no account ID match (e.g. direct account, not Connect), 
+	// If no account ID match (e.g. direct account, not Connect),
 	// try to find the single active connection
 	if stripeAccountID == "" && len(conns) == 1 {
 		return conns[0].OrgID, nil

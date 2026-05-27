@@ -5,6 +5,7 @@ import {
   BarChart3,
   Plug,
   Activity,
+  Workflow,
   Store,
   Settings,
   ChevronLeft,
@@ -13,6 +14,7 @@ import {
 } from "lucide-react";
 import {
   FEATURE_BENCHMARKS,
+  FEATURE_PLAYBOOKS,
   useFeatureFlag,
 } from "@/contexts/FeatureFlagContext";
 
@@ -20,6 +22,12 @@ const navItems = [
   { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { to: "/customers", label: "Customers", icon: Users },
   { to: "/marketplace", label: "Marketplace", icon: Store },
+  {
+    to: "/playbooks",
+    label: "Playbooks",
+    icon: Workflow,
+    requiredFeature: FEATURE_PLAYBOOKS,
+  },
   {
     to: "/benchmarks",
     label: "Benchmarks",
@@ -46,8 +54,13 @@ export default function Sidebar({
 }: SidebarProps) {
   const location = useLocation();
   const benchmarkAccess = useFeatureFlag(FEATURE_BENCHMARKS);
+  const playbookAccess = useFeatureFlag(FEATURE_PLAYBOOKS);
   const visibleNavItems = navItems.filter(
-    (item) => !item.requiredFeature || benchmarkAccess.allowed,
+    (item) =>
+      !item.requiredFeature ||
+      (item.requiredFeature === FEATURE_BENCHMARKS
+        ? benchmarkAccess.allowed
+        : playbookAccess.allowed),
   );
 
   function isActive(to: string, end?: boolean) {

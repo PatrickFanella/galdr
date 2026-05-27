@@ -247,7 +247,7 @@ func (s *BenchmarkComparisonService) Compare(ctx context.Context, orgID uuid.UUI
 			continue
 		}
 		value := values[aggregate.MetricName]
-		position := benchmarkPosition(value, aggregate, definition)
+		position := benchmarkPositionForDefinition(value, aggregate, definition)
 		percentiles = append(percentiles, position)
 		response.Metrics = append(response.Metrics, BenchmarkMetricResponse{
 			Key:        aggregate.MetricName,
@@ -283,7 +283,7 @@ var benchmarkMetricDefinitions = map[string]benchmarkMetricDefinition{
 	repository.BenchmarkMetricIntegrationUsage: {label: "Integration count", unit: "count"},
 }
 
-func benchmarkPosition(value float64, aggregate repository.BenchmarkAggregate, definition benchmarkMetricDefinition) float64 {
+func benchmarkPositionForDefinition(value float64, aggregate repository.BenchmarkAggregate, definition benchmarkMetricDefinition) float64 {
 	position := estimateBenchmarkPercentile(value, aggregate)
 	if definition.lowerIsBetter {
 		return 100 - position
